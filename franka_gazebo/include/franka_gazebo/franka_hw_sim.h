@@ -2,6 +2,8 @@
 
 #include <franka/robot_state.h>
 #include <franka_gazebo/joint.h>
+#include <franka_hw/control_mode.h>
+#include <franka_hw/franka_cartesian_command_interface.h>
 #include <franka_hw/franka_model_interface.h>
 #include <franka_hw/franka_state_interface.h>
 #include <franka_hw/model_base.h>
@@ -15,6 +17,7 @@
 #include <cmath>
 #include <gazebo/common/common.hh>
 #include <gazebo/physics/physics.hh>
+#include <atomic>
 #include <map>
 #include <memory>
 
@@ -30,6 +33,7 @@ namespace franka_gazebo {
  * - hardware_interface/JointStateInterface
  * - hardware_interface/EffortJointInterface
  *
+ * ### franka_hw/FrankaPoseCartesianInterface
  * ### franka_hw/FrankaStateInterface
  * ### franka_hw/FrankaModelInterface
  *
@@ -38,6 +42,14 @@ namespace franka_gazebo {
  */
 class FrankaHWSim : public gazebo_ros_control::RobotHWSim {
  public:
+  /**
+   * Default constructor.
+   *
+   */
+  FrankaHWSim();
+
+  virtual ~FrankaHWSim() override = default;
+
   /**
    * Initialize the simulated robot hardware and parse all supported transmissions.
    *
@@ -89,6 +101,18 @@ class FrankaHWSim : public gazebo_ros_control::RobotHWSim {
    */
   void eStopActive(const bool active) override;
 
+  /**
+   * Prepares switching between controllers (not real-time capable).
+   *
+   * @param[in] start_list Controllers requested to be started.
+   * @param[in] stop_list Controllers requested to be stopped.
+   *
+   * @return True if the preparation has been successful, false otherwise.
+   */
+  virtual bool prepareSwitch(
+      const std::list<hardware_interface::ControllerInfo>& start_list,
+      const std::list<hardware_interface::ControllerInfo>& stop_list) override;
+
  private:
   std::string arm_id_;
   gazebo::physics::ModelPtr robot_;
@@ -98,8 +122,12 @@ class FrankaHWSim : public gazebo_ros_control::RobotHWSim {
   hardware_interface::EffortJointInterface eji_;
   franka_hw::FrankaStateInterface fsi_;
   franka_hw::FrankaModelInterface fmi_;
+  franka_hw::FrankaPoseCartesianInterface fpci_;
+  franka_hw::ControlMode current_control_mode_ = franka_hw::ControlMode::None;
 
   franka::RobotState robot_state_;
+  franka::CartesianPose fpci_command_;
+  std::array<double, 7> fpci_q_nullspace_;
   std::unique_ptr<franka_hw::ModelBase> model_;
 
   ros::ServiceServer service_set_ee_;
@@ -112,6 +140,7 @@ class FrankaHWSim : public gazebo_ros_control::RobotHWSim {
 
   void initJointStateHandle(const std::shared_ptr<franka_gazebo::Joint>& joint);
   void initEffortCommandHandle(const std::shared_ptr<franka_gazebo::Joint>& joint);
+  void initFrankaCartesianPoseHandle(franka::CartesianPose& pose_cartesian_command);
   void initFrankaStateHandle(const std::string& robot,
                              const urdf::Model& urdf,
                              const transmission_interface::TransmissionInfo& transmission);
@@ -126,6 +155,8 @@ class FrankaHWSim : public gazebo_ros_control::RobotHWSim {
   bool readParameters(const ros::NodeHandle& nh, const urdf::Model& urdf);
 
   void guessEndEffector(const ros::NodeHandle& nh, const urdf::Model& urdf);
+
+  std::unordered_map<std::string, double> evalCartesianPoseCommands(const franka::CartesianPose& pose_cartesian_command);
 
   template <int N>
   std::array<double, N> readArray(std::string param, std::string name = "") {

@@ -4,6 +4,8 @@
 #include <franka_example_controllers/pseudo_inversion.h>
 #include <franka_gazebo/model_kdl.h>
 #include <franka_hw/franka_hw.h>
+#include <franka_hw/franka_model_interface.h>
+#include <franka_hw/resource_helpers.h>
 #include <franka_hw/services.h>
 #include <franka_msgs/SetEEFrame.h>
 #include <franka_msgs/SetForceTorqueCollisionBehavior.h>
@@ -14,8 +16,13 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 namespace franka_gazebo {
+
+FrankaHWSim::FrankaHWSim() :
+  fpci_command_(
+      {1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0}) {}
 
 bool FrankaHWSim::initSim(const std::string& robot_namespace,
                           ros::NodeHandle model_nh,
@@ -139,12 +146,14 @@ bool FrankaHWSim::initSim(const std::string& robot_namespace,
                                                  << joint->name << "': " << k_interface);
     }
   }
+  initFrankaCartesianPoseHandle(this->fpci_command_);
 
   // After all handles have been assigned to interfaces, register them
   registerInterface(&this->eji_);
   registerInterface(&this->jsi_);
   registerInterface(&this->fsi_);
   registerInterface(&this->fmi_);
+  registerInterface(&this->fpci_);
 
   // Initialize ROS Services
   initServices(model_nh);
@@ -160,6 +169,13 @@ void FrankaHWSim::initJointStateHandle(const std::shared_ptr<franka_gazebo::Join
 void FrankaHWSim::initEffortCommandHandle(const std::shared_ptr<franka_gazebo::Joint>& joint) {
   this->eji_.registerHandle(
       hardware_interface::JointHandle(this->jsi_.getHandle(joint->name), &joint->command));
+}
+
+void FrankaHWSim::initFrankaCartesianPoseHandle(franka::CartesianPose& pose_cartesian_command) {
+  franka_hw::FrankaCartesianPoseHandle franka_cartesian_pose_handle(
+      this->fsi_.getHandle(this->arm_id_ + "_robot"), pose_cartesian_command.O_T_EE,
+      pose_cartesian_command.elbow);
+  this->fpci_.registerHandle(franka_cartesian_pose_handle);
 }
 
 void FrankaHWSim::initFrankaStateHandle(
@@ -303,11 +319,29 @@ void FrankaHWSim::readSim(ros::Time time, ros::Duration period) {
 }
 
 void FrankaHWSim::writeSim(ros::Time /*time*/, ros::Duration /*period*/) {
+  std::unordered_map<std::string, double> cartesian_commands;
+
+  if (current_control_mode_ == franka_hw::ControlMode::None) {
+      // FIXME: if no control mode is requested, the robot should be controlled to stay still
+      return;
+  } else if (current_control_mode_ == franka_hw::ControlMode::CartesianPose) {
+      // Evaluate commands for the cartesian pose task
+      cartesian_commands = evalCartesianPoseCommands(this->fpci_command_);
+  }
+
   auto g = this->model_->gravity(this->robot_state_);
 
   for (auto& pair : this->joints_) {
     auto joint = pair.second;
-    auto command = joint->command;
+
+    double command = 0.0;
+    if ((current_control_mode_ == franka_hw::ControlMode::JointTorque) ||
+        // Fingers are torque controlled in any case in the simulation
+        (pair.first.find("finger") != std::string::npos)) {
+      command = joint->command;
+    } else if (current_control_mode_ == franka_hw::ControlMode::CartesianPose) {
+      command = cartesian_commands.at(pair.first);
+    }
 
     // Check if this joint is affected by gravity compensation
     std::string prefix = this->arm_id_ + "_joint";
@@ -326,6 +360,46 @@ void FrankaHWSim::writeSim(ros::Time /*time*/, ros::Duration /*period*/) {
 }
 
 void FrankaHWSim::eStopActive(bool /* active */) {}
+
+bool FrankaHWSim::prepareSwitch(const std::list<hardware_interface::ControllerInfo>& start_list,
+                                const std::list<hardware_interface::ControllerInfo>& stop_list) {
+  franka_hw::ResourceWithClaimsMap start_resource_map = franka_hw::getResourceMap(start_list);
+  franka_hw::ArmClaimedMap start_arm_claim_map;
+  if (!getArmClaimedMap(start_resource_map, start_arm_claim_map)) {
+    ROS_ERROR("FrankaHW: Unknown interface claimed for starting!");
+    return false;
+  }
+
+  franka_hw::ControlMode start_control_mode = getControlMode(arm_id_, start_arm_claim_map);
+
+  franka_hw::ResourceWithClaimsMap stop_resource_map = franka_hw::getResourceMap(stop_list);
+  franka_hw::ArmClaimedMap stop_arm_claim_map;
+  if (!franka_hw::getArmClaimedMap(stop_resource_map, stop_arm_claim_map)) {
+    ROS_ERROR("FrankaHW: Unknown interface claimed for stopping!");
+    return false;
+  }
+  franka_hw::ControlMode stop_control_mode = franka_hw::getControlMode(arm_id_, stop_arm_claim_map);
+
+  franka_hw::ControlMode requested_control_mode = current_control_mode_;
+  requested_control_mode &= ~stop_control_mode;
+  requested_control_mode |= start_control_mode;
+
+  if (current_control_mode_ != requested_control_mode) {
+    ROS_INFO_STREAM("FrankaHWSim: Prepared switching controllers to "
+                    << requested_control_mode);
+    current_control_mode_ = requested_control_mode;
+  }
+
+  if (current_control_mode_ == franka_hw::ControlMode::CartesianPose) {
+      // At this point no controllers are writing on fpci_command_ yet
+      // We can set fpci_command_ to the current robot state to avoid jumps
+      // at initialization time
+      this->fpci_command_ = franka::CartesianPose(this->robot_state_.O_T_EE);
+      this->fpci_q_nullspace_ = this->robot_state_.q;
+  }
+
+  return true;
+}
 
 bool FrankaHWSim::readParameters(const ros::NodeHandle& nh, const urdf::Model& urdf) {
   try {
@@ -435,6 +509,71 @@ void FrankaHWSim::guessEndEffector(const ros::NodeHandle& nh, const urdf::Model&
   std::string F_x_Cee;  // NOLINT [readability-identifier-naming]
   nh.param<std::string>("F_x_Cee", F_x_Cee, def_f_x_cee);
   this->robot_state_.F_x_Cee = readArray<3>(F_x_Cee, "F_x_Cee");
+}
+
+std::unordered_map<std::string, double> FrankaHWSim::evalCartesianPoseCommands(const franka::CartesianPose& pose_cartesian_command) {
+  std::unordered_map<std::string, double> commands;
+
+  auto model_handle = fmi_.getHandle(this->arm_id_ + "_model");
+  std::array<double, 7> coriolis_array = model_handle.getCoriolis();
+  std::array<double, 42> jacobian_array = model_handle.getZeroJacobian(franka::Frame::kEndEffector);
+
+  Eigen::Map<Eigen::Matrix<double, 7, 1>> coriolis(coriolis_array.data());
+  Eigen::Map<Eigen::Matrix<double, 6, 7>> jacobian(jacobian_array.data());
+  Eigen::Map<Eigen::Matrix<double, 7, 1>> q(this->robot_state_.q.data());
+  Eigen::Map<Eigen::Matrix<double, 7, 1>> dq(this->robot_state_.dq.data());
+  Eigen::Map<Eigen::Matrix<double, 7, 1>> q_d_nullspace(this->fpci_q_nullspace_.data());
+
+  Eigen::MatrixXd jacobian_transpose_pinv;
+  franka_example_controllers::pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
+
+  Eigen::Affine3d current_pose(Eigen::Matrix4d::Map(this->robot_state_.O_T_EE.data()));
+  Eigen::Affine3d desired_pose(Eigen::Matrix4d::Map(pose_cartesian_command.O_T_EE.data()));
+
+  Eigen::AngleAxisd orientation_error(
+      current_pose.rotation().transpose() * desired_pose.rotation());
+  Eigen::Vector3d log_orientation_error =
+      current_pose.rotation() * orientation_error.axis() * orientation_error.angle();
+
+  Eigen::VectorXd pose_error(6);
+  pose_error.head<3>() = desired_pose.translation() - current_pose.translation();
+  pose_error.tail<3>() = log_orientation_error;
+
+  Eigen::Matrix<double, 6, 6> stiffness;
+  Eigen::Matrix<double, 6, 6> damping;
+
+  double translational_stiffness{10.0};
+  double rotational_stiffness{10.0};
+  double nullspace_stiffness{20.0};
+
+  stiffness.setIdentity();
+  stiffness.topLeftCorner(3, 3)
+      << translational_stiffness * Eigen::Matrix3d::Identity();
+  stiffness.bottomRightCorner(3, 3)
+      << rotational_stiffness * Eigen::Matrix3d::Identity();
+
+  damping.setIdentity();
+  damping.topLeftCorner(3, 3)
+      << 2.0 * std::sqrt(translational_stiffness) * Eigen::Matrix3d::Identity();
+  damping.bottomRightCorner(3, 3)
+      << 2.0 * std::sqrt(rotational_stiffness) * Eigen::Matrix3d::Identity();
+
+  Eigen::VectorXd tau_task(7);
+  Eigen::VectorXd tau_nullspace(7);
+  Eigen::VectorXd tau_d(7);
+  tau_task << jacobian.transpose() * (stiffness * pose_error + damping * (-jacobian * dq));
+  tau_nullspace << (Eigen::MatrixXd::Identity(7, 7) -
+                    jacobian.transpose() * jacobian_transpose_pinv) *
+                       (nullspace_stiffness * (q_d_nullspace - q) +
+                        2.0 * std::sqrt(nullspace_stiffness) * (-dq));
+  tau_d << coriolis + tau_task + tau_nullspace;
+
+  for (int i = 0; i < 7; i++) {
+    const std::string name = this->arm_id_ + "_joint" + std::to_string(i + 1);
+    commands[name] = tau_d[i];
+  }
+
+  return commands;
 }
 
 void FrankaHWSim::updateRobotStateDynamics() {
